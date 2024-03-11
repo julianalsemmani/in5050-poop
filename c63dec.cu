@@ -9,6 +9,7 @@
 
 #include "c63.h"
 #include "c63_write.h"
+#include "quantdct.h"
 #include "common.h"
 #include "io.h"
 #include "me.h"
@@ -448,7 +449,7 @@ int main(int argc, char **argv)
     exit(EXIT_FAILURE);
   }
 
-  struct c63_common *cm = calloc(1, sizeof(*cm));
+  c63_common *cm = (c63_common*)calloc(1, sizeof(*cm));
   cm->e_ctx.fp = fin;
 
   int framenum = 0;
