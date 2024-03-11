@@ -8,7 +8,6 @@
 #include <string.h>
 
 #include "common.h"
-#include "dsp.h"
 
 void destroy_frame(struct frame *f)
 {
