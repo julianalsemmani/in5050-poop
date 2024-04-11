@@ -14,7 +14,7 @@
 #include "me.h"
 #include "tables.h"
 
-static void sad_block_8x8(uint8_t *block1, uint8_t *block2, int stride, int *result)
+__device__ static void sad_block_8x8(uint8_t *block1, uint8_t *block2, int stride, int *result)
 {
   int u, v;
 
@@ -30,92 +30,148 @@ static void sad_block_8x8(uint8_t *block1, uint8_t *block2, int stride, int *res
 }
 
 /* Motion estimation for 8x8 block */
-static void me_block_8x8(struct c63_common *cm, int mb_x, int mb_y,
+__global__ static void me_block_8x8(struct c63_common *cm, struct macroblock *mb_gpu, int mb_x, int mb_y,
     uint8_t *orig, uint8_t *ref, int color_component)
 {
-  struct macroblock *mb =
-    &cm->curframe->mbs[color_component][mb_y*cm->padw[color_component]/8+mb_x];
+  struct macroblock *mb = &mb_gpu[mb_y*cm->padw[color_component]/8+mb_x];
 
   int range = cm->me_search_range;
 
   /* Quarter resolution for chroma channels. */
   if (color_component > 0) { range /= 2; }
 
-  int left = mb_x * 8 - range;
-  int top = mb_y * 8 - range;
-  int right = mb_x * 8 + range;
-  int bottom = mb_y * 8 + range;
+  // int left = mb_x * 8 - range;
+  // int top = mb_y * 8 - range;
+  // int right = mb_x * 8 + range;
+  // int bottom = mb_y * 8 + range;
 
   int w = cm->padw[color_component];
   int h = cm->padh[color_component];
 
   /* Make sure we are within bounds of reference frame. TODO: Support partial
      frame bounds. */
-  if (left < 0) { left = 0; }
-  if (top < 0) { top = 0; }
-  if (right > (w - 8)) { right = w - 8; }
-  if (bottom > (h - 8)) { bottom = h - 8; }
+  // if (left < 0) { left = 0; }
+  // if (top < 0) { top = 0; }
+  // if (right > (w - 8)) { right = w - 8; }
+  // if (bottom > (h - 8)) { bottom = h - 8; }
 
-  int x, y;
+  int x = mb_x * 8 + threadIdx.x - range;
+  int y = mb_y * 8 + threadIdx.y - range;
+
+  if (x < 0) return;
+  if (y < 0) return;
+  if (x > w - 8) return;
+  if (y > h - 8) return;
 
   int mx = mb_x * 8;
   int my = mb_y * 8;
 
-  int best_sad = INT_MAX;
+  // Store all SADs in a flat array such that we can find the minimun SAD later
+  extern __shared__ int sad_array[];
 
-  for (y = top; y < bottom; ++y)
+  int sad;
+  sad_block_8x8(orig + my*w+mx, ref + y*w+x, w, &sad);
+
+  // Store the SAD for this thread in the appropriate index in the array
+  int flattenedThreadIdx = threadIdx.y * blockDim.x + threadIdx.x;
+  sad_array[flattenedThreadIdx] = sad;
+
+  __syncthreads();
+
+  // Sequential addressing minimum algorithm
+  for(int stride = (blockDim.x*blockDim.y)/2; stride > 1; stride /= 2)
   {
-    for (x = left; x < right; ++x)
+    // Each iteration the amount of threads working will be halved since we compare 2 elements each iteration
+    if(flattenedThreadIdx < stride)
     {
-      int sad;
-      sad_block_8x8(orig + my*w+mx, ref + y*w+x, w, &sad);
-
-      /* printf("(%4d,%4d) - %d\n", x, y, sad); */
-
-      if (sad < best_sad)
+      if(sad_array[flattenedThreadIdx] > sad_array[flattenedThreadIdx + stride])
       {
-        mb->mv_x = x - mx;
-        mb->mv_y = y - my;
-        best_sad = sad;
+        sad_array[flattenedThreadIdx] = sad_array[flattenedThreadIdx + stride]; 
       }
     }
+
+    __syncthreads();
   }
 
-  /* Here, there should be a threshold on SAD that checks if the motion vector
-     is cheaper than intraprediction. We always assume MV to be beneficial */
+  if (sad == sad_array[0])
+  {
+    mb->mv_x = x - mx;
+    mb->mv_y = y - my;
+    mb->use_mv = 1;
+  }
 
-  /* printf("Using motion vector (%d, %d) with SAD %d\n", mb->mv_x, mb->mv_y,
-     best_sad); */
-
-  mb->use_mv = 1;
 }
 
 void c63_motion_estimate(struct c63_common *cm)
 {
   /* Compare this frame with previous reconstructed frame */
+  struct c63_common *cm_gpu;
+  // struct macroblock **mb_gpu;
+  struct macroblock *mb_Y, *mb_U, *mb_V;
+
+  cudaMalloc((void **)&cm_gpu, sizeof(struct c63_common));
+  // cudaMalloc(&mb_gpu, sizeof(void *)*COLOR_COMPONENTS);
+  // cudaMemset(mb_gpu, 0, sizeof(void *)*COLOR_COMPONENTS);
+
+  cudaMalloc((void **)&mb_Y, sizeof(struct macroblock)*(cm->mb_rows)*(cm->mb_cols));
+  cudaMalloc((void **)&mb_U, sizeof(struct macroblock)*(cm->mb_rows/2)*(cm->mb_cols/2));
+  cudaMalloc((void **)&mb_V, sizeof(struct macroblock)*(cm->mb_rows/2)*(cm->mb_cols/2));
+
+  cudaMemcpy(cm_gpu, cm, sizeof(struct c63_common), cudaMemcpyHostToDevice);
+
+  cudaMemcpy(mb_Y, cm->curframe->mbs[Y_COMPONENT], sizeof(struct macroblock)*(cm->mb_rows)*(cm->mb_cols), cudaMemcpyHostToDevice);
+  cudaMemcpy(mb_U, cm->curframe->mbs[U_COMPONENT], sizeof(struct macroblock)*(cm->mb_rows/2)*(cm->mb_cols/2), cudaMemcpyHostToDevice);
+  cudaMemcpy(mb_V, cm->curframe->mbs[V_COMPONENT], sizeof(struct macroblock)*(cm->mb_rows/2)*(cm->mb_cols/2), cudaMemcpyHostToDevice);
+
+  // cudaMemcpy(&mb_gpu[Y_COMPONENT], cm->mb_rows * cm->mb_cols, sizeof(struct macroblock), cudaMemcpyHostToDevice);
+  
+  printf("cm value: %p\n", (void*)mb_Y);
+
   int mb_x, mb_y;
+  uint8_t *orig_Y, *ref_Y;
+  cudaMalloc((void **)&orig_Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT]);
+  cudaMalloc((void **)&ref_Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT]);
+  printf("%s\n", cudaGetErrorString(cudaGetLastError()));
+
+
+  //cm->curframe->orig,
+  cudaMemcpy(orig_Y, cm->curframe->orig->Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT], cudaMemcpyHostToDevice);
+  cudaMemcpy(ref_Y, cm->curframe->recons->Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT], cudaMemcpyHostToDevice);
+  
+  dim3 threadsPerBlock(cm->me_search_range*2, cm->me_search_range*2);
 
   /* Luma */
   for (mb_y = 0; mb_y < cm->mb_rows; ++mb_y)
   {
     for (mb_x = 0; mb_x < cm->mb_cols; ++mb_x)
-    {
-      me_block_8x8(cm, mb_x, mb_y, cm->curframe->orig->Y,
-          cm->refframe->recons->Y, Y_COMPONENT);
+    { 
+      me_block_8x8<<<1, threadsPerBlock, threadsPerBlock.x*threadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_Y, mb_x, mb_y, orig_Y, ref_Y, Y_COMPONENT);
+
+      // printf("%s\n", cudaGetErrorString(cudaGetLastError()));
     }
   }
+
+
+  cudaDeviceSynchronize();
 
   /* Chroma */
   for (mb_y = 0; mb_y < cm->mb_rows / 2; ++mb_y)
   {
     for (mb_x = 0; mb_x < cm->mb_cols / 2; ++mb_x)
     {
-      me_block_8x8(cm, mb_x, mb_y, cm->curframe->orig->U,
-          cm->refframe->recons->U, U_COMPONENT);
-      me_block_8x8(cm, mb_x, mb_y, cm->curframe->orig->V,
-          cm->refframe->recons->V, V_COMPONENT);
+      // me_block_8x8(cm, mb_x, mb_y, cm->curframe->orig->U,
+      //     cm->refframe->recons->U, U_COMPONENT);
+      // me_block_8x8(cm, mb_x, mb_y, cm->curframe->orig->V,
+      //     cm->refframe->recons->V, V_COMPONENT);
     }
   }
+
+  cudaFree(orig_Y);
+  cudaFree(ref_Y);
+  cudaFree(cm_gpu);
+  cudaFree(mb_Y);
+  cudaFree(mb_U);
+  cudaFree(mb_V);
 }
 
 /* Motion compensation for 8x8 block */
