@@ -30,9 +30,10 @@ __device__ static void sad_block_8x8(uint8_t *block1, uint8_t *block2, int strid
 }
 
 /* Motion estimation for 8x8 block */
-__global__ static void me_block_8x8(struct c63_common *cm, struct macroblock *mb_gpu, int mb_x, int mb_y,
-    uint8_t *orig, uint8_t *ref, int color_component)
+__global__ static void me_block_8x8(struct c63_common *cm, struct macroblock *mb_gpu, uint8_t *orig, uint8_t *ref, int color_component)
 {
+  int mb_x = blockIdx.x;
+  int mb_y = blockIdx.y;
   struct macroblock *mb = &mb_gpu[mb_y*cm->padw[color_component]/8+mb_x];
 
   int range = cm->me_search_range;
@@ -75,7 +76,7 @@ __global__ static void me_block_8x8(struct c63_common *cm, struct macroblock *mb
     {
       if(sad_array[flattenedThreadIdx] > sad_array[flattenedThreadIdx + stride])
       {
-        sad_array[flattenedThreadIdx] = sad_array[flattenedThreadIdx + stride]; 
+        sad_array[flattenedThreadIdx] = sad_array[flattenedThreadIdx + stride];
       }
     }
 
@@ -131,31 +132,23 @@ void c63_motion_estimate(struct c63_common *cm)
   cudaMemcpy(recons_Y, cm->curframe->recons->Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT], cudaMemcpyHostToDevice);
   cudaMemcpy(recons_U, cm->curframe->recons->U, sizeof(uint8_t)*cm->padw[U_COMPONENT]*cm->padh[U_COMPONENT], cudaMemcpyHostToDevice);
   cudaMemcpy(recons_V, cm->curframe->recons->V, sizeof(uint8_t)*cm->padw[V_COMPONENT]*cm->padh[V_COMPONENT], cudaMemcpyHostToDevice);
-  
+
   dim3 lumaThreadsPerBlock(cm->me_search_range*2, cm->me_search_range*2);
+  dim3 lumaGridDim(cm->mb_rows, cm->mb_cols);
 
   /* Luma */
-  for (mb_y = 0; mb_y < cm->mb_rows; ++mb_y)
-  {
-    for (mb_x = 0; mb_x < cm->mb_cols; ++mb_x)
-    { 
-      me_block_8x8<<<1, lumaThreadsPerBlock, lumaThreadsPerBlock.x*lumaThreadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_Y, mb_x, mb_y, orig_Y, recons_Y, Y_COMPONENT);
-    }
-  }
+  me_block_8x8<<<lumaGridDim, lumaThreadsPerBlock, lumaThreadsPerBlock.x*lumaThreadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_Y, orig_Y, recons_Y, Y_COMPONENT);
 
 
   dim3 chromaThreadsPerBlock(cm->me_search_range, cm->me_search_range);
+  dim3 chromaGridDim(cm->mb_rows/2, cm->mb_cols/2);
 
   /* Chroma */
-  for (mb_y = 0; mb_y < cm->mb_rows / 2; ++mb_y)
-  {
-    for (mb_x = 0; mb_x < cm->mb_cols / 2; ++mb_x)
-    {
-      me_block_8x8<<<1, chromaThreadsPerBlock, chromaThreadsPerBlock.x*chromaThreadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_U, mb_x, mb_y, orig_U, recons_U, U_COMPONENT);
-      me_block_8x8<<<1, chromaThreadsPerBlock, chromaThreadsPerBlock.x*chromaThreadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_V, mb_x, mb_y, orig_V, recons_V, V_COMPONENT);
-    }
-  }
-  
+
+  me_block_8x8<<<chromaGridDim, chromaThreadsPerBlock, chromaThreadsPerBlock.x*chromaThreadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_U, orig_U, recons_U, U_COMPONENT);
+  me_block_8x8<<<chromaGridDim, chromaThreadsPerBlock, chromaThreadsPerBlock.x*chromaThreadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_V, orig_V, recons_V, V_COMPONENT);
+
+
   cudaDeviceSynchronize();
 
   cudaFree(orig_Y);
