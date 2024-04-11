@@ -40,20 +40,9 @@ __global__ static void me_block_8x8(struct c63_common *cm, struct macroblock *mb
   /* Quarter resolution for chroma channels. */
   if (color_component > 0) { range /= 2; }
 
-  // int left = mb_x * 8 - range;
-  // int top = mb_y * 8 - range;
-  // int right = mb_x * 8 + range;
-  // int bottom = mb_y * 8 + range;
-
   int w = cm->padw[color_component];
   int h = cm->padh[color_component];
 
-  /* Make sure we are within bounds of reference frame. TODO: Support partial
-     frame bounds. */
-  // if (left < 0) { left = 0; }
-  // if (top < 0) { top = 0; }
-  // if (right > (w - 8)) { right = w - 8; }
-  // if (bottom > (h - 8)) { bottom = h - 8; }
 
   int x = mb_x * 8 + threadIdx.x - range;
   int y = mb_y * 8 + threadIdx.y - range;
@@ -106,12 +95,9 @@ void c63_motion_estimate(struct c63_common *cm)
 {
   /* Compare this frame with previous reconstructed frame */
   struct c63_common *cm_gpu;
-  // struct macroblock **mb_gpu;
   struct macroblock *mb_Y, *mb_U, *mb_V;
 
   cudaMalloc((void **)&cm_gpu, sizeof(struct c63_common));
-  // cudaMalloc(&mb_gpu, sizeof(void *)*COLOR_COMPONENTS);
-  // cudaMemset(mb_gpu, 0, sizeof(void *)*COLOR_COMPONENTS);
 
   cudaMalloc((void **)&mb_Y, sizeof(struct macroblock)*(cm->mb_rows)*(cm->mb_cols));
   cudaMalloc((void **)&mb_U, sizeof(struct macroblock)*(cm->mb_rows/2)*(cm->mb_cols/2));
@@ -123,51 +109,61 @@ void c63_motion_estimate(struct c63_common *cm)
   cudaMemcpy(mb_U, cm->curframe->mbs[U_COMPONENT], sizeof(struct macroblock)*(cm->mb_rows/2)*(cm->mb_cols/2), cudaMemcpyHostToDevice);
   cudaMemcpy(mb_V, cm->curframe->mbs[V_COMPONENT], sizeof(struct macroblock)*(cm->mb_rows/2)*(cm->mb_cols/2), cudaMemcpyHostToDevice);
 
-  // cudaMemcpy(&mb_gpu[Y_COMPONENT], cm->mb_rows * cm->mb_cols, sizeof(struct macroblock), cudaMemcpyHostToDevice);
-  
-  printf("cm value: %p\n", (void*)mb_Y);
 
   int mb_x, mb_y;
-  uint8_t *orig_Y, *ref_Y;
+  uint8_t *orig_Y, *recons_Y;
   cudaMalloc((void **)&orig_Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT]);
-  cudaMalloc((void **)&ref_Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT]);
+  cudaMalloc((void **)&recons_Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT]);
+
+  uint8_t *orig_U, *recons_U;
+  cudaMalloc((void **)&orig_U, sizeof(uint8_t)*cm->padw[U_COMPONENT]*cm->padh[U_COMPONENT]);
+  cudaMalloc((void **)&recons_U, sizeof(uint8_t)*cm->padw[U_COMPONENT]*cm->padh[U_COMPONENT]);
+
+  uint8_t *orig_V, *recons_V;
+  cudaMalloc((void **)&orig_V, sizeof(uint8_t)*cm->padw[V_COMPONENT]*cm->padh[V_COMPONENT]);
+  cudaMalloc((void **)&recons_V, sizeof(uint8_t)*cm->padw[V_COMPONENT]*cm->padh[V_COMPONENT]);
   printf("%s\n", cudaGetErrorString(cudaGetLastError()));
 
 
-  //cm->curframe->orig,
   cudaMemcpy(orig_Y, cm->curframe->orig->Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT], cudaMemcpyHostToDevice);
-  cudaMemcpy(ref_Y, cm->curframe->recons->Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT], cudaMemcpyHostToDevice);
+  cudaMemcpy(orig_U, cm->curframe->orig->U, sizeof(uint8_t)*cm->padw[U_COMPONENT]*cm->padh[U_COMPONENT], cudaMemcpyHostToDevice);
+  cudaMemcpy(orig_V, cm->curframe->orig->V, sizeof(uint8_t)*cm->padw[V_COMPONENT]*cm->padh[V_COMPONENT], cudaMemcpyHostToDevice);
+  cudaMemcpy(recons_Y, cm->curframe->recons->Y, sizeof(uint8_t)*cm->padw[Y_COMPONENT]*cm->padh[Y_COMPONENT], cudaMemcpyHostToDevice);
+  cudaMemcpy(recons_U, cm->curframe->recons->U, sizeof(uint8_t)*cm->padw[U_COMPONENT]*cm->padh[U_COMPONENT], cudaMemcpyHostToDevice);
+  cudaMemcpy(recons_V, cm->curframe->recons->V, sizeof(uint8_t)*cm->padw[V_COMPONENT]*cm->padh[V_COMPONENT], cudaMemcpyHostToDevice);
   
-  dim3 threadsPerBlock(cm->me_search_range*2, cm->me_search_range*2);
+  dim3 lumaThreadsPerBlock(cm->me_search_range*2, cm->me_search_range*2);
 
   /* Luma */
   for (mb_y = 0; mb_y < cm->mb_rows; ++mb_y)
   {
     for (mb_x = 0; mb_x < cm->mb_cols; ++mb_x)
     { 
-      me_block_8x8<<<1, threadsPerBlock, threadsPerBlock.x*threadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_Y, mb_x, mb_y, orig_Y, ref_Y, Y_COMPONENT);
-
-      // printf("%s\n", cudaGetErrorString(cudaGetLastError()));
+      me_block_8x8<<<1, lumaThreadsPerBlock, lumaThreadsPerBlock.x*lumaThreadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_Y, mb_x, mb_y, orig_Y, recons_Y, Y_COMPONENT);
     }
   }
 
 
-  cudaDeviceSynchronize();
+  dim3 chromaThreadsPerBlock(cm->me_search_range, cm->me_search_range);
 
   /* Chroma */
   for (mb_y = 0; mb_y < cm->mb_rows / 2; ++mb_y)
   {
     for (mb_x = 0; mb_x < cm->mb_cols / 2; ++mb_x)
     {
-      // me_block_8x8(cm, mb_x, mb_y, cm->curframe->orig->U,
-      //     cm->refframe->recons->U, U_COMPONENT);
-      // me_block_8x8(cm, mb_x, mb_y, cm->curframe->orig->V,
-      //     cm->refframe->recons->V, V_COMPONENT);
+      me_block_8x8<<<1, chromaThreadsPerBlock, chromaThreadsPerBlock.x*chromaThreadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_U, mb_x, mb_y, orig_U, recons_U, U_COMPONENT);
+      me_block_8x8<<<1, chromaThreadsPerBlock, chromaThreadsPerBlock.x*chromaThreadsPerBlock.y*sizeof(int)>>>(cm_gpu, mb_V, mb_x, mb_y, orig_V, recons_V, V_COMPONENT);
     }
   }
+  
+  cudaDeviceSynchronize();
 
   cudaFree(orig_Y);
-  cudaFree(ref_Y);
+  cudaFree(recons_Y);
+  cudaFree(orig_U);
+  cudaFree(recons_U);
+  cudaFree(orig_V);
+  cudaFree(recons_V);
   cudaFree(cm_gpu);
   cudaFree(mb_Y);
   cudaFree(mb_U);
